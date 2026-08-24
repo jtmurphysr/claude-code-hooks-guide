@@ -4,6 +4,7 @@
 **Scope:** how hooks actually behave, how they fail, and how we review them.
 **Status:** living doc. Hook surface moves fast — see [Verifying against your version](#verifying-against-your-version) before you trust any schema detail here.
 **Last verified against the official hooks reference:** 2026-08-24.
+**Worked examples:** the two hooks in §6 are wired and running in [`jtmurphysr/agent-harness`](https://github.com/jtmurphysr/agent-harness) — see [`.claude/hooks/`](https://github.com/jtmurphysr/agent-harness/tree/main/.claude/hooks) and the [`settings.json`](https://github.com/jtmurphysr/agent-harness/blob/main/.claude/settings.json) that wires them. Every figure quoted about them is measured from that repo, not estimated.
 
 ---
 
