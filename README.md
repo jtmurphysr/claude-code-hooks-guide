@@ -8,6 +8,32 @@
 
 ---
 
+## Start here
+
+**Writing your first hook?** [§2 The contract](#2-the-contract) → [§4 the fail-closed preamble](#4-house-pattern-fail-closed-by-default) → copy [§6.3's Stop gate](#63-stop-gate-done-on-evidence-not-on-the-models-opinion). That is the whole path; the rest is why.
+
+**Reviewing someone else's?** [§9 the checklist](#9-review-checklist-for-prs-touching-claude) is self-contained.
+
+**Deciding whether you need a hook at all?** [§1](#1-five-layers-of-control) — the answer is often no.
+
+<details>
+<summary>Full contents</summary>
+
+1. [Five layers of control](#1-five-layers-of-control) — pick the lowest one that works
+2. [The contract](#2-the-contract) — matchers, exit codes, structured output, `if`
+3. [The four ways a hook goes quiet](#3-the-four-ways-a-hook-goes-quiet) — the section that matters
+4. [House pattern: fail-closed by default](#4-house-pattern-fail-closed-by-default) — the preamble, and the bug it had
+5. [What a hook can't see](#5-what-a-hook-cant-see) — the permanent ceiling
+6. [What's actually worth hooking](#6-whats-actually-worth-hooking) — SessionStart, PostToolUse, Stop
+7. [Team distribution and settings precedence](#7-team-distribution-and-settings-precedence)
+8. [`.claude/` is an attack surface](#8-claude-is-an-attack-surface) — two CVEs, one of them not a hook
+9. [Review checklist](#9-review-checklist-for-prs-touching-claude)
+10. [Verifying against your version](#verifying-against-your-version) — this document included
+
+</details>
+
+---
+
 ## TL;DR
 
 - A hook is your code, run by Claude Code at a fixed lifecycle event, whether or not the model felt like cooperating.
@@ -122,10 +148,14 @@ Top-level fields available on every event:
 | Field | Effect |
 |---|---|
 | `continue` | `false` stops Claude processing entirely after the hook runs. Takes precedence over event-specific decisions. This is how you hand control to a human. |
-| `systemMessage` | Shown in the transcript. |
-| `additionalContext` | Injected into the model's context. Discarded by events that don't accept it. |
+| `stopReason` | The reason shown when you stop. Pair it with `continue: false` — otherwise the halt is unexplained. |
+| `systemMessage` | Context message shown to Claude. Delivery varies by event. |
+| `suppressOutput` | Suppresses certain output. Event-dependent. |
+| `terminalSequence` | Terminal notifications — bell, window title, desktop. |
 
-Per-event decisions live under `hookSpecificOutput`. For `PreToolUse`:
+Everything else is **event-scoped and goes inside `hookSpecificOutput`** — including `additionalContext`, which is the one people most often put at top level, where it is silently ignored. `permissionDecision`, `updatedInput`, and `retry` live there too. Check the reference for the event you're on; each event documents which of these it honours.
+
+For `PreToolUse`:
 
 ```json
 {
@@ -521,7 +551,7 @@ Three patterns earn their maintenance. The rest is usually a permission rule or 
 
 ### 6.1 `SessionStart` — inject the context that must always be present
 
-Project conventions, current branch state, the layer taxonomy, the `project_context.md`. Returning `additionalContext` beats hoping the model reads a file. Mind the 10,000-character cap.
+Project conventions, current branch state, the invariants a new contributor would get wrong. Returning `additionalContext` — inside `hookSpecificOutput`, per §2.3 — beats hoping the model reads a file. Mind the 10,000-character cap.
 
 **In the harness:** `.claude/hooks/inject-context.sh` injects `AGENTS.md`, the operating constitution. That file opens with "read it in full before taking **any** action" — a request, not a guarantee. The hook makes the load-bearing half unconditional.
 
