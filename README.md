@@ -108,7 +108,7 @@ Two version-and-event caveats on that table:
 
 Read that middle row twice. `exit 1` — the conventional Unix failure code — **blocks nothing**. If your policy hook exits 1 on failure, you have written a logger.
 
-This is the most common way an existing script gets miswired. CI linters conventionally exit `1`; our own `scripts/validate_harness.py` documents "Exits 0 if clean. Exits 1 with actionable output on violations." Correct for CI, inert as a hook. Wrapping is the fix, not editing the linter — see §6.3.
+This is the most common way an existing script gets miswired. CI linters conventionally exit `1`. The structural linter in our own harness, [`scripts/validate_harness.py`](https://github.com/jtmurphysr/agent-harness/blob/main/scripts/validate_harness.py), documents exactly that: "Exits 0 if clean. Exits 1 with actionable output on violations." Correct for CI, inert as a hook. Wrapping is the fix, not editing the linter — see §6.3.
 
 **Not every event honours that table.** `WorktreeCreate` fails creation on *any* nonzero exit, and events differ in whether they can block at all: `PostToolUse` never blocks (the tool already ran) but does show stderr to the model, while `PostToolBatch` blocks the agentic loop before the next model call. Check the reference for the event you're on rather than assuming this table is universal.
 
@@ -171,7 +171,7 @@ Half the hook scripts in the wild — the ones that `jq` out `.tool_input.comman
 
 It is only evaluated on tool events. **On any other event, a handler with `if` set never runs at all.**
 
-### 2.5 Three things that catch people
+### 2.5 Four things that catch people
 
 1. **`PostToolUse` cannot undo the edit.** It already ran. Exit `2` feeds your stderr to the model so it fixes the code; it does not roll anything back.
 2. **`Stop` exit `2` forces the agent to keep working.** This is how you gate "done."
@@ -260,9 +260,15 @@ warn_open() {
   exit 1
 }
 
-# Top-level only, so exiting here is safe.
+# Top-level only, so exiting here is safe. Takes any number of deps and
+# reports all the missing ones -- a single-argument version silently ignores
+# `require jq cksum`, which is the §3.1 bug living inside the guard itself.
 require() {
-  command -v "$1" >/dev/null 2>&1 || die_closed "missing dependency: $1"
+  local missing=() dep
+  for dep in "$@"; do
+    command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
+  done
+  [ ${#missing[@]} -eq 0 ] || die_closed "missing dependencies: ${missing[*]}"
 }
 
 # Returns 1 on empty payload.  Call: PAYLOAD=$(read_payload) || die_closed "..."
@@ -277,6 +283,20 @@ read_payload() {
 # Returns jq's status.  Call: file=$(field '.a.b') || die_closed "..."
 field() {
   jq -er "$1" <<<"$PAYLOAD" 2>/dev/null
+}
+
+# For fields that are legitimately absent rather than schema drift. This is the
+# ONE place a default is correct -- everywhere else `// empty` is the fail-open
+# smell from §3.1.  Call: flag=$(field_opt '.stop_hook_active' 'false')
+field_opt() {
+  jq -er "$1" <<<"$PAYLOAD" 2>/dev/null || printf '%s' "${2-}"
+}
+
+# Emit findings to the model and block. Top-level only.
+# `tail`, because output past 10k chars becomes a file path, not feedback.
+fail() {
+  { echo "$1"; shift; printf '%s\n' "$@" | tail -40; } >&2
+  exit 2
 }
 
 # Emit a PreToolUse decision and exit 0.  decide deny|ask|allow "reason"
@@ -453,10 +473,9 @@ source "$CLAUDE_PROJECT_DIR/.claude/hooks/lib/preamble.sh"
 require jq
 PAYLOAD=$(read_payload) || die_closed "empty stdin payload"
 
-# Prevents an infinite Stop loop: set when we're already continuing from a Stop hook.
-if [ "$(jq -r '.stop_hook_active // false' <<<"$PAYLOAD")" = "true" ]; then
-  exit 0
-fi
+# Prevents an infinite Stop loop: set when we're already continuing from a Stop
+# hook. Legitimately absent on the first pass, so field_opt (not field) is right.
+[ "$(field_opt '.stop_hook_active' 'false')" = "true" ] && exit 0
 
 if ! out=$(make test 2>&1); then
   # tail, not the whole log: hook output is truncated to a file past 10k chars,
