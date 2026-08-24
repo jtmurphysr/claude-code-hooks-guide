@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# This repo is a document, so "CI" means: does the document still describe
+# something true? The guide argues that a guardrail nobody has watched succeed
+# may never have run. It then shipped a broken anchor link, a bash example that
+# would not parse, and two helper bugs that were invisible to reading and
+# obvious to running. Hence this job.
+jobs:
+  verify-doc:
+    name: Verify the guide against itself
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The preamble check sources the published preamble and exercises it.
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+
+      # Anchors, code fences, `bash -n` on every runnable block, and the
+      # published preamble's actual behaviour. The slug algorithm self-tests
+      # against real GitHub anchor IDs first -- a checker with a wrong slug
+      # function passes a broken link, which is how the §6.3 link shipped.
+      - name: Structural and behavioural checks
+        run: python3 scripts/check-doc.py
+
+      # Network-dependent, so it runs separately: a flaky third-party host
+      # should not read as "the document is wrong."
+      - name: External links
+        run: python3 scripts/check-doc.py --links
+        continue-on-error: true

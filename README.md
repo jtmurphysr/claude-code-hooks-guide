@@ -10,7 +10,7 @@
 
 ## Start here
 
-**Writing your first hook?** [§2 The contract](#2-the-contract) → [§4 the fail-closed preamble](#4-house-pattern-fail-closed-by-default) → copy [§6.3's Stop gate](#63-stop-gate-done-on-evidence-not-on-the-models-opinion). That is the whole path; the rest is why.
+**Writing your first hook?** [§2 The contract](#2-the-contract) → [§4 the fail-closed preamble](#4-house-pattern-fail-closed-by-default) → copy [§6.3's Stop gate](#63-stop--gate-done-on-evidence-not-on-the-models-opinion). That is the whole path; the rest is why.
 
 **Reviewing someone else's?** [§9 the checklist](#9-review-checklist-for-prs-touching-claude) is self-contained.
 
@@ -226,7 +226,8 @@ set -uo pipefail
 input=$(cat)
 cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty')
 if printf '%s' "$cmd" | grep -Eq 'rm[[:space:]]+-[a-zA-Z]*r'; then
-  # ... deny ...
+  echo "blocked: destructive rm" >&2
+  exit 2
 fi
 exit 0
 ```
