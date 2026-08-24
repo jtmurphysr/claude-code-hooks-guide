@@ -345,7 +345,7 @@ Decide per hook, and write the choice down in a comment.
 | Prevent (policy, secrets, protected paths) | **Fail closed.** `exit 2`. |
 | Verify (security analysis, type check) | **Fail closed.** "Analysis didn't run" is not "code is clean." |
 | Format / style | Fail open (`exit 1`). Cosmetic. |
-| Observe (logging, Webex notify, metrics) | Fail open, and mark it `"async": true` so it never stalls the loop. |
+| Observe (logging, push notification, metrics) | Fail open, and mark it `"async": true` so it never stalls the loop. |
 
 > The test: **fail-open is only acceptable for a hook whose permanent absence you'd accept.** If you wouldn't ship without it, it fails closed.
 
@@ -538,7 +538,11 @@ A gate verified only against a red tree is a gate you have never seen let work t
 
 ### 6.4 Notifications
 
-If you're piping hook events anywhere, send them to your team's own channel — ours is Webex — via a bot token in **local** settings. Never a committed secret, and never a third-party webhook without approval: a notification hook is an egress path, and it runs on an engineer's machine with that engineer's network access.
+A notification hook is an **egress path** that runs on an engineer's machine with that engineer's network access. Pick the destination on that basis, not on convenience.
+
+What we run: a **self-hosted [ntfy](https://ntfy.sh) instance** — private, authenticated, on our own infrastructure — with the token in `settings.local.json`, never committed. Self-hosting is the point rather than a preference: the events a hook emits describe what an agent is doing inside your repo, and a third-party SaaS webhook makes that someone else's log to retain, breach, or subpoena.
+
+Use whatever you like — ntfy, Slack, Webex, a webhook of your own. Two rules survive the choice: **the token lives in local settings**, and **a destination you don't control is a data-handling decision**, not a formatting one.
 
 ---
 
