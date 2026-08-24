@@ -253,16 +253,36 @@ That contract is a simplification, and the honest version is worth stating becau
 A convention that lives only in a comment gets violated in month four by someone reasonably assuming a helper is a helper. Two things make it stick. **Name the classes so the distinction is visible at the call site** — a returning helper is always `x=$(f …) || die_closed`, an exiting one is never on the right of an `=`. And **enforce it in CI**, because `shellcheck` will not catch this:
 
 ```bash
-# Fails if a returning helper is captured without a || guard.
-grep -nE '\$\((field|field_opt|read_payload)\b[^)]*\)\s*$' .claude/hooks/*.sh \
+# find, not .claude/hooks/*.sh — the glob does not recurse, so it would skip
+# lib/preamble.sh: the file that DEFINES every helper these checks police.
+files=$(find .claude/hooks -name '*.sh' ! -name 'test-hooks.sh')
+# Skip comment lines. The first run of this check failed on a `# Call: x=$(field …)`
+# usage comment; a check that fails a correct repo gets switched off.
+strip_comments() { grep -vE '^[^:]*:[0-9]+:[[:space:]]*#'; }
+
+# A returning helper captured without a || guard.
+echo "$files" | xargs grep -nE '\$\((field|field_opt|read_payload)[^)]*\)[[:space:]]*$' \
+  | strip_comments | grep -q . \
   && { echo "unguarded capture — needs || die_closed"; exit 1; }
 
-# Fails if an exiting helper is used in a substitution at all.
-grep -nE '\$\((die_closed|warn_open|require|decide|fail)\b' .claude/hooks/*.sh \
+# An exiting helper used inside a substitution at all.
+echo "$files" | xargs grep -nE '\$\((die_closed|warn_open|require|decide|fail)[^)]*\)' \
+  | strip_comments | grep -q . \
   && { echo "exiting helper inside \$( ) — exits the subshell only"; exit 1; }
 ```
 
 That second grep is the one that would have caught the bug this section is named after.
+
+> **`[[:space:]]`, not `\s`. No `\b`.** Those are GNU extensions. On BSD `grep` — which is what a stock macOS ships — an `-E` pattern containing `\s` matches **nothing**, and a check that matches nothing is indistinguishable from a clean repo. The guard meant to catch silent failure fails silently on half your team's laptops.
+>
+> Which means the check itself needs a check. Run both greps against a deliberately-bad fixture in CI and assert they *fire*:
+>
+> ```bash
+> printf 'x=$(field .a)\ny=$(die_closed "z")\n' > /tmp/probe.sh
+> # each pattern must match exactly 1 line, or the pattern is broken
+> ```
+>
+> That is the whole argument of this guide applied to its own tooling: a guardrail nobody has watched succeed is a guardrail that may never have run.
 
 Source this preamble at the top of every hook that makes a decision.
 
@@ -317,7 +337,15 @@ read_payload() {
 # AND STILL PRINTS IT. `jq -er` on a real `false` prints "false" and exits 1, so
 # field() reads a healthy payload as schema drift and die_closed blocks it, while
 # a `|| printf default` fallback appends and yields "false\nfalse". Branch on the
-# output, not the status.  Call: file=$(field '.a.b') || die_closed "..."
+# output, not the status.
+#
+# Known limitation: `jq -r` is a text channel, so a field whose VALUE is the
+# string "null" is indistinguishable from an absent one and reads as absent. No
+# Claude Code field is the literal string "null", so this is a footnote -- but it
+# is the residue of carrying a type over a text pipe, worth knowing before you
+# reuse this somewhere the payload shape is yours.
+#
+# Call: file=$(field '.a.b') || die_closed "..."
 field() {
   local out
   out=$(jq -r "$1" <<<"$PAYLOAD" 2>/dev/null) || return 1
@@ -383,13 +411,25 @@ file=$(field '.tool_input.file_path')          || die_closed "no .tool_input.fil
 # today; don't build the policy on an assumption you haven't asserted.
 rel="${file#"$CLAUDE_PROJECT_DIR"/}"
 
-# ESCAPE CHECK, and it has to come first. If the strip was a no-op then the path
-# is not under the repo at all -- rel is still absolute, no case arm below can
-# match, and the hook would exit 0. That is how a guard whose job is protecting
-# .claude/ waves through ~/.claude/settings.json and ~/.ssh/config.
+# ESCAPE CHECKS, and they have to come first. TWO of them, because they catch
+# different things and the second is the one people miss.
+#
+#   (a) strip was a no-op -> path was never under the repo. rel stays absolute,
+#       no case arm matches, hook exits 0: ~/.ssh/config sails through.
+#   (b) strip SUCCEEDED but rel still traverses out. /repo/../../etc/passwd
+#       gives rel=../../etc/passwd -- (a) passes, no case arm matches, exit 0.
+#       Checking only (a) catches paths that LOOK outside and misses paths that
+#       ARE outside, which is the same bug in a better disguise.
 if [ "$rel" = "$file" ]; then
   decide ask "${file} is outside the project directory. Confirm this is intended."
 fi
+case "$rel" in
+  ..|../*|*/../*|*/..)
+    decide ask "${file} escapes the project directory via '..'. Confirm this is intended."
+    ;;
+esac
+# Symlinks defeat both. If you care, canonicalise first -- `realpath -m` on
+# GNU/macOS-with-coreutils -- and compare the resolved paths, not the strings.
 
 case "$rel" in
   .claude/*|.github/workflows/*)
@@ -709,7 +749,9 @@ The mechanism that lets you customize the agent lets a repo author customize it 
 - [ ] No `// empty` or `|| true` on a path that makes a policy decision.
 - [ ] **No helper exits from inside a command substitution.** Every fallible helper is called as `x=$(helper ...) || die_closed "..."`. Enforced by the §4 greps in CI, not by this line.
 - [ ] Any hook that blocks checks `CLAUDE_PROJECT_DIR` **explicitly, before the `source`**, and exits `2`. `set -u` and `${VAR:?}` both exit 1, which allows the call.
-- [ ] A path-based guard rejects paths that escape the project directory. If the prefix strip was a no-op, no `case` arm matches and the hook exits 0 — `~/.ssh/config` is outside every pattern you wrote.
+- [ ] A path-based guard rejects paths that escape the project directory **two ways**: the prefix strip was a no-op (`~/.ssh/config`), *and* the strip succeeded but the result still traverses out (`../../etc/passwd`). Checking only the first catches paths that look outside and misses paths that are outside.
+- [ ] Static checks use `[[:space:]]`, not `\s`, and no `\b` — both are GNU-only and match nothing on BSD grep. They use `find`, not `.claude/hooks/*.sh`, which doesn't recurse into `lib/`.
+- [ ] **The static checks are themselves tested** against a known-bad fixture, so a pattern that matches nothing is distinguishable from a clean repo.
 - [ ] Every policy failure exits **`2`**, not `1`.
 - [ ] The fail-open/fail-closed choice is deliberate and commented.
 - [ ] Someone asked whether `ask` would serve better than `deny` on the success path.
