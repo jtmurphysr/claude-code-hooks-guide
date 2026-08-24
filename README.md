@@ -207,6 +207,16 @@ No `jq` on `$PATH` → `cmd` is empty → grep doesn't match → `exit 0` → th
 
 `tool_input` fields change between versions. A `jq` path that stops resolving degrades to the same empty-string silence as a missing binary. Assert the field exists; don't default it.
 
+**And asserting it is subtler than it looks.** The obvious tool is `jq -e`, which exits non-zero when a field is missing. It also exits non-zero when the field is present and **`false`** — and prints the value anyway:
+
+```console
+$ echo '{"stop_hook_active":false}' | jq -er '.stop_hook_active'; echo "exit=$?"
+false
+exit=1
+```
+
+So `-e` cannot distinguish *absent* from *legitimately false*, and it fails in both directions at once. A `field()` built on it blocks a healthy payload as "schema drift"; a `field_opt()` built on it appends its default to jq's output and returns `false\nfalse`. Both shipped in this document. **Branch on the output, not the exit status** — see the preamble in §4.
+
 ### 3.3 Timeout
 
 A hook that exceeds its `timeout` is cancelled. **Cancelled is not blocked.** If your `Stop` gate runs a 12-minute suite under a 60-second timeout, your gate does not exist. Set `timeout` explicitly on anything that shells out.
@@ -301,23 +311,44 @@ read_payload() {
   printf '%s' "$p"
 }
 
-# jq -e exits non-zero on null/false, so a missing field is an error, not "".
-# Returns jq's status.  Call: file=$(field '.a.b') || die_closed "..."
+# Missing field -> non-zero. A field that is legitimately `false` -> "false", 0.
+#
+# Do NOT use `jq -e` here. -e exits 1 when the last output is false OR null --
+# AND STILL PRINTS IT. `jq -er` on a real `false` prints "false" and exits 1, so
+# field() reads a healthy payload as schema drift and die_closed blocks it, while
+# a `|| printf default` fallback appends and yields "false\nfalse". Branch on the
+# output, not the status.  Call: file=$(field '.a.b') || die_closed "..."
 field() {
-  jq -er "$1" <<<"$PAYLOAD" 2>/dev/null
+  local out
+  out=$(jq -r "$1" <<<"$PAYLOAD" 2>/dev/null) || return 1
+  [ "$out" = "null" ] && return 1
+  printf '%s' "$out"
 }
 
-# For fields that are legitimately absent rather than schema drift. This is the
+# For fields that are legitimately optional rather than schema drift. This is the
 # ONE place a default is correct -- everywhere else `// empty` is the fail-open
 # smell from §3.1.  Call: flag=$(field_opt '.stop_hook_active' 'false')
 field_opt() {
-  jq -er "$1" <<<"$PAYLOAD" 2>/dev/null || printf '%s' "${2-}"
+  local out
+  out=$(jq -r "$1" <<<"$PAYLOAD" 2>/dev/null) || { printf '%s' "${2-}"; return 0; }
+  case "$out" in
+    ""|null) printf '%s' "${2-}" ;;
+    *)       printf '%s' "$out" ;;
+  esac
+}
+
+# Claude Code truncates output past 10k chars to a file + preview, which is not
+# feedback a model can act on. Keep every emitted string under the cap.
+HOOK_OUTPUT_CAP=9000
+clamp() {
+  local s; s=$(cat)
+  if [ "${#s}" -le "$HOOK_OUTPUT_CAP" ]; then printf '%s' "$s"
+  else printf '%s\n\n[truncated at %s chars]' "${s:0:$HOOK_OUTPUT_CAP}" "$HOOK_OUTPUT_CAP"; fi
 }
 
 # Emit findings to the model and block. Top-level only.
-# `tail`, because output past 10k chars becomes a file path, not feedback.
 fail() {
-  { echo "$1"; shift; printf '%s\n' "$@" | tail -40; } >&2
+  { echo "$1"; shift; printf '%s\n' "$@" | tail -40; } | clamp >&2
   exit 2
 }
 
@@ -516,7 +547,17 @@ This is the highest-value hook we run. The model declaring completion is a claim
 ```bash
 #!/usr/bin/env bash
 set -uo pipefail
+HOOK_NAME="gate-done"
+
+# Bootstrap guard — mandatory in any hook that blocks. die_closed lives in the
+# file this line is about to load, and both `set -u` and ${VAR:?} exit 1 here,
+# which does not block. See the sidebar in §4.
+if [ -z "${CLAUDE_PROJECT_DIR:-}" ]; then
+  echo "[$HOOK_NAME] BLOCKED — CLAUDE_PROJECT_DIR unset" >&2
+  exit 2
+fi
 source "$CLAUDE_PROJECT_DIR/.claude/hooks/lib/preamble.sh"
+
 require jq
 PAYLOAD=$(read_payload) || die_closed "empty stdin payload"
 
