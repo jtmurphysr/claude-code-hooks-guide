@@ -19,7 +19,7 @@
 
 ---
 
-## 1. Four layers of control
+## 1. Five layers of control
 
 Pick the lowest one that works. Every layer up costs maintenance.
 
@@ -27,6 +27,7 @@ Pick the lowest one that works. Every layer up costs maintenance.
 |---|---|---|
 | `CLAUDE.md` / rules files | Instructions in the model's context | **None.** Competes for attention with everything else. Works most of the time, which is not a safety property. |
 | `permissions` in `settings.json` | Declarative allow/ask/deny rules on tool calls | **Deterministic, no code.** Built in. Underused. |
+| `if` on a handler (§2.4) | Permission-rule syntax matched against tool name *and arguments* | **Deterministic, no code**, but scoped to one handler. Does the argument parsing you'd otherwise hand-roll. |
 | Hooks | Your program, run at a lifecycle event | **Deterministic, arbitrary logic.** Costs you a script to maintain and a failure mode to manage. |
 | Sandbox / worktree / container | Blast-radius containment | **Catches what nobody modeled.** The only layer that helps with the failure you didn't imagine. |
 
@@ -232,6 +233,27 @@ And the subtler one, which is §4's whole subject: `exit 2` from inside a comman
 >
 > **Contract: helpers never exit. They return non-zero. The call site decides.**
 
+That contract is a simplification, and the honest version is worth stating because the gap is where the original bug lived. There are **two classes of helper**, and they cannot be collapsed into one rule — `die_closed` has to exit; that *is* the block:
+
+| Class | Members | Safe inside `$( )`? |
+|---|---|---|
+| **Returning** — report failure to the caller | `field`, `field_opt`, `read_payload` | **Yes.** That's the point. |
+| **Exiting** — terminate the hook | `die_closed`, `warn_open`, `require`, `decide`, `fail` | **No. Top-level only.** |
+
+A convention that lives only in a comment gets violated in month four by someone reasonably assuming a helper is a helper. Two things make it stick. **Name the classes so the distinction is visible at the call site** — a returning helper is always `x=$(f …) || die_closed`, an exiting one is never on the right of an `=`. And **enforce it in CI**, because `shellcheck` will not catch this:
+
+```bash
+# Fails if a returning helper is captured without a || guard.
+grep -nE '\$\((field|field_opt|read_payload)\b[^)]*\)\s*$' .claude/hooks/*.sh \
+  && { echo "unguarded capture — needs || die_closed"; exit 1; }
+
+# Fails if an exiting helper is used in a substitution at all.
+grep -nE '\$\((die_closed|warn_open|require|decide|fail)\b' .claude/hooks/*.sh \
+  && { echo "exiting helper inside \$( ) — exits the subshell only"; exit 1; }
+```
+
+That second grep is the one that would have caught the bug this section is named after.
+
 Source this preamble at the top of every hook that makes a decision.
 
 **`.claude/hooks/lib/preamble.sh`**
@@ -313,6 +335,13 @@ decide() {
 ```bash
 #!/usr/bin/env bash
 set -uo pipefail
+
+# BOOTSTRAP GUARD — see the warning under this block. die_closed does not exist
+# until the source succeeds, and every shorthand for "fail if unset" exits 1.
+if [ -z "${CLAUDE_PROJECT_DIR:-}" ]; then
+  echo "[guard-write-paths] BLOCKED — CLAUDE_PROJECT_DIR unset" >&2
+  exit 2
+fi
 source "$CLAUDE_PROJECT_DIR/.claude/hooks/lib/preamble.sh"
 
 require jq
@@ -322,6 +351,14 @@ file=$(field '.tool_input.file_path')          || die_closed "no .tool_input.fil
 # Normalise to a repo-relative path. Claude Code sends absolute paths for Edit/Write
 # today; don't build the policy on an assumption you haven't asserted.
 rel="${file#"$CLAUDE_PROJECT_DIR"/}"
+
+# ESCAPE CHECK, and it has to come first. If the strip was a no-op then the path
+# is not under the repo at all -- rel is still absolute, no case arm below can
+# match, and the hook would exit 0. That is how a guard whose job is protecting
+# .claude/ waves through ~/.claude/settings.json and ~/.ssh/config.
+if [ "$rel" = "$file" ]; then
+  decide ask "${file} is outside the project directory. Confirm this is intended."
+fi
 
 case "$rel" in
   .claude/*|.github/workflows/*)
@@ -355,6 +392,16 @@ Wire it:
 ```
 
 (Check that alternation against your version's actual tool set before copying — matchers are exact strings, so a tool name that no longer exists is dead weight and a new one is an uncovered gap.)
+
+> **The bootstrap is the one place this apparatus can't defend itself.** Every guard above depends on `die_closed`, which lives in the preamble, which is located through `$CLAUDE_PROJECT_DIR`. If that variable is unset, the failure happens *before* the tool to handle it exists — and every shorthand lands on the wrong exit code:
+>
+> | Written as | Exit | Effect |
+> |---|---|---|
+> | `source "$CLAUDE_PROJECT_DIR/..."` under `set -u` | `1` | **allowed** |
+> | `source "${CLAUDE_PROJECT_DIR:?unset}/..."` | `1` | **allowed** |
+> | explicit `[ -z … ] && { echo >&2; exit 2; }` | `2` | blocked |
+>
+> `set -u` and `:?` both exit **1**, which is non-blocking. A fail-closed guard that hits this fails open, silently, on the one condition it cannot report. Write the check by hand, above the `source`, in every hook that blocks. (Both figures verified, not assumed — and this was live in the [harness](https://github.com/jtmurphysr/agent-harness/blob/main/.claude/hooks/gate-done.sh) until a reviewer caught it.)
 
 ### Choosing fail-open vs fail-closed
 
@@ -619,7 +666,9 @@ The mechanism that lets you customize the agent lets a repo author customize it 
 
 - [ ] Every dependency is asserted with `require`, not assumed.
 - [ ] No `// empty` or `|| true` on a path that makes a policy decision.
-- [ ] **No helper exits from inside a command substitution.** Every fallible helper is called as `x=$(helper ...) || die_closed "..."`.
+- [ ] **No helper exits from inside a command substitution.** Every fallible helper is called as `x=$(helper ...) || die_closed "..."`. Enforced by the §4 greps in CI, not by this line.
+- [ ] Any hook that blocks checks `CLAUDE_PROJECT_DIR` **explicitly, before the `source`**, and exits `2`. `set -u` and `${VAR:?}` both exit 1, which allows the call.
+- [ ] A path-based guard rejects paths that escape the project directory. If the prefix strip was a no-op, no `case` arm matches and the hook exits 0 — `~/.ssh/config` is outside every pattern you wrote.
 - [ ] Every policy failure exits **`2`**, not `1`.
 - [ ] The fail-open/fail-closed choice is deliberate and commented.
 - [ ] Someone asked whether `ask` would serve better than `deny` on the success path.
