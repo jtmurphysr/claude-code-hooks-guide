@@ -12,7 +12,7 @@
 
 **Writing your first hook?** [§2 The contract](#2-the-contract) → [§4 the fail-closed preamble](#4-house-pattern-fail-closed-by-default) → copy [§6.3's Stop gate](#63-stop--gate-done-on-evidence-not-on-the-models-opinion). That is the whole path; the rest is why.
 
-**Reviewing someone else's?** [§9 the checklist](#9-review-checklist-for-prs-touching-claude) is self-contained.
+**Reviewing someone else's?** [§10 the checklist](#10-review-checklist-for-prs-touching-claude) is self-contained.
 
 **Deciding whether you need a hook at all?** [§1](#1-five-layers-of-control) — the answer is often no.
 
@@ -27,7 +27,8 @@
 6. [What's actually worth hooking](#6-whats-actually-worth-hooking) — SessionStart, PostToolUse, Stop
 7. [Team distribution and settings precedence](#7-team-distribution-and-settings-precedence)
 8. [`.claude/` is an attack surface](#8-claude-is-an-attack-surface) — two CVEs, one of them not a hook
-9. [Review checklist](#9-review-checklist-for-prs-touching-claude)
+9. [Testing the guardrails](#9-testing-the-guardrails) — control validation, not contract validation
+10. [Review checklist](#10-review-checklist-for-prs-touching-claude)
 10. [Verifying against your version](#verifying-against-your-version) — this document included
 
 </details>
@@ -774,7 +775,117 @@ The mechanism that lets you customize the agent lets a repo author customize it 
 
 ---
 
-## 9. Review checklist for PRs touching `.claude/`
+## 9. Testing the guardrails
+
+Everything above treats the hook as the thing doing the checking. The moment it becomes executable policy, it is also a thing under test:
+
+```
+code → tests → guardrail → guardrail tests → CI
+```
+
+Two different questions hide inside "is the hook tested":
+
+- **Contract validation** — does it run, parse a real payload, and exit cleanly?
+- **Control validation** — can the forbidden thing get through?
+
+The first is table stakes. The second is adversarial by construction, and it is the one that caught every bug named in this guide.
+
+> **Don't test that the guardrail runs. Test that the forbidden thing cannot get through.**
+
+Five rules. Each one is a bug that shipped in this repo's own hooks.
+
+### 9.1 Assert the decision, not the message
+
+The Stop gate guarded its own bootstrap with `${CLAUDE_PROJECT_DIR:?...}`. It printed exactly what you would want to see:
+
+```
+[gate-done] BLOCKED — CLAUDE_PROJECT_DIR unset
+```
+
+and exited **1**, which blocks nothing. A test asserting that stderr contains `BLOCKED` passes while the gate is functionally absent.
+
+```bash
+env -u CLAUDE_PROJECT_DIR bash .claude/hooks/gate-done.sh </dev/null >/dev/null 2>&1
+is "gate-done exits 2 without CLAUDE_PROJECT_DIR" "2" "$?"
+```
+
+The exit code **is** the decision. Message text is a courtesy to the agent; asserting on it tests the courtesy.
+
+### 9.2 Every check needs a negative control, and CI has to run it
+
+The §4 static greps originally used `\s` and `\b`. Both are GNU extensions, so on BSD grep they match **nothing** — the check found no violations, reported clean, and would have kept reporting clean forever.
+
+A check nobody has watched fail is in the same epistemic position as a guardrail nobody has watched block.
+
+```bash
+tmp=$(mktemp -d); printf 'x=$(field .a)\n' > "$tmp/probe.sh"
+n=$(grep -cE '\$\((field|field_opt|read_payload)[^)]*\)[[:space:]]*$' "$tmp/probe.sh")
+is "unguarded-capture grep fires on a known-bad file" "1" "$n"
+```
+
+This is also where the recursion stops. You do not need tests for the tests for the tests — you need **one executed negative control per check**. The trust anchor is a known-bad fixture that CI proves the check rejects.
+
+### 9.3 Prove the guard ran at all
+
+Every rule above tests a guard's *logic*, which quietly assumes it executed. Two controls in this project reported success for months without ever running:
+
+- A merge-triggered agent was configured with a mode that only fires on `workflow_dispatch` and `schedule`, then wired to `pull_request`. It logged `No trigger found, skipping remaining steps` and exited **0** on every merge for four months.
+- A module-boundary linter's allowlist named modules that did not exist in the repo. It walked **zero files** and printed `No boundary violations found` — as a required status check.
+
+Neither is a logic bug, and no payload fixture catches either. The guard has to emit a **count**, and CI has to assert that count is non-zero:
+
+```bash
+if [ "$files_checked" -eq 0 ]; then
+  echo "Checked 0 files — the linter is not pointed at this repo." >&2
+  exit 1
+fi
+```
+
+Zero files is not a clean repo. It is a linter pointed at nothing.
+
+### 9.4 Test the precondition, not the post-hoc classification
+
+The same Stop gate classified pytest's exit code after the fact, with a branch dedicated to "environment not provisioned":
+
+```bash
+case "$rc" in
+  2|3|4) fail "Test suite could not run — pip install -e \".[dev]\"" ;;
+  *)     fail "Test suite is failing. You are not done." ;;
+esac
+```
+
+That branch never fired once. `python -m <missing module>` exits **1** — the same code pytest uses for "tests ran and failed." The two are identical by `rc` and differ only in output, so an absent pytest was reported as a failing suite, on a machine that had no suite.
+
+Ask the precondition directly instead of inferring it from an overloaded code:
+
+```bash
+"$PY" -c 'import pytest' >/dev/null 2>&1 || fail "pytest not importable — environment not provisioned."
+```
+
+### 9.5 Control tests must be hermetic
+
+A test for that gate asserted against the ambient working tree. It passed — until a commit edited a `.py`, at which point the tree it read stopped matching the tree it assumed.
+
+A control test that observes ambient state passes or fails for reasons unrelated to the control. Build the world it observes:
+
+```bash
+scratch=$(mktemp -d)
+mkdir -p "$scratch/.claude/hooks/lib"
+cp .claude/hooks/gate-done.sh    "$scratch/.claude/hooks/"
+cp .claude/hooks/lib/preamble.sh "$scratch/.claude/hooks/lib/"
+git -C "$scratch" init -q
+git -C "$scratch" -c user.email=t@t -c user.name=t commit -qm init --allow-empty
+```
+
+Then drive the guard through known-positive and known-negative states you created, not ones you inherited.
+
+---
+
+**One thing that looks testable and isn't.** Timeouts. Claude Code kills the process, so the hook gets no opportunity to express policy and a test can only assert the harness's behaviour, not yours. The fact that matters is a design one from §3.3: a timed-out fail-closed gate fails **open**. Keep the hook faster than its timeout; don't write a test implying the script gets a say.
+
+---
+
+## 10. Review checklist for PRs touching `.claude/`
 
 - [ ] Every dependency is asserted with `require`, not assumed.
 - [ ] No `// empty` or `|| true` on a path that makes a policy decision.
@@ -791,6 +902,10 @@ The mechanism that lets you customize the agent lets a repo author customize it 
 - [ ] An existing CI script wired in as a hook has its `exit 1` translated to `exit 2`. Linters exit 1 by convention; hooks ignore it.
 - [ ] The "checks could not run" path is distinguishable from "checks failed," and says how to fix the environment.
 - [ ] The gate was tested on a **green** tree, not only a red one. A gate nobody has watched succeed is a gate that may never succeed.
+- [ ] Tests assert the **exit code**, not the stderr text. A guard can print `BLOCKED` and return an allow (§9.1).
+- [ ] The guard proves it **ran**: it emits a count of what it inspected, and CI fails when that count is zero (§9.3).
+- [ ] Preconditions are asserted directly, not inferred from an overloaded exit code (§9.4).
+- [ ] Control tests are **hermetic** — they build the state they observe rather than reading the ambient working tree (§9.5).
 - [ ] `matcher` is the **tool name only**, and the exact-string vs regex behaviour (§2.1) is what the author intended. Argument filtering uses `if`, never `matcher`.
 - [ ] Blocking hooks that feed the model have a loop guard whose terminal state is `continue: false` — not another `exit 2`, which just re-enters the loop.
 - [ ] Any counter or state file is keyed narrowly and reset on success.

@@ -89,6 +89,12 @@ def check_anchors(doc: str) -> None:
     print("\ninternal links")
     heads = {slug(m.group(1)) for m in re.finditer(r"^#{2,4}\s+(.+)$", doc, re.M)}
     links = re.findall(r"\]\(#([^)]+)\)", doc)
+    # §9.3, applied to this file: "0 broken of 0" is not a clean document, it is
+    # an extractor that stopped matching. Every count this script prints is a
+    # claim about work done, and a zero count means no work was done.
+    if not links:
+        bad("found 0 internal links — the link extractor is not matching")
+        return
     broken = sorted({l for l in links if l not in heads})
     if broken:
         bad(
@@ -102,15 +108,22 @@ def check_anchors(doc: str) -> None:
 def check_fences(doc: str) -> None:
     print("\nstructure")
     n = sum(1 for line in doc.splitlines() if line.startswith("```"))
-    ok(f"{n} code fences, balanced") if n % 2 == 0 else bad(
-        "unbalanced code fences", f"{n} found"
-    )
+    if n == 0:
+        bad("found 0 code fences — the fence counter is not matching")
+    elif n % 2 == 0:
+        ok(f"{n} code fences, balanced")
+    else:
+        bad("unbalanced code fences", f"{n} found")
 
 
 def check_bash_blocks(doc: str) -> None:
     print("\nbash blocks parse")
     blocks = re.findall(r"```bash\n(.*?)```", doc, re.S)
+    if not blocks:
+        bad("found 0 bash blocks — the block extractor is not matching")
+        return
     failures = []
+    checked = 0
     with tempfile.TemporaryDirectory() as tmp:
         for i, block in enumerate(blocks):
             # Fragments (case arms, loose snippets) aren't standalone scripts.
@@ -118,6 +131,7 @@ def check_bash_blocks(doc: str) -> None:
                 r"^(#!|set |[a-z_]+\(\) \{|if |require |PAYLOAD=)", block, re.M
             ):
                 continue
+            checked += 1
             p = Path(tmp) / f"b{i}.sh"
             p.write_text(block)
             r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
@@ -127,8 +141,13 @@ def check_bash_blocks(doc: str) -> None:
                 )
     if failures:
         bad(f"{len(failures)} bash block(s) fail syntax check", "\n".join(failures))
+    elif checked == 0:
+        # Reporting len(blocks) here would have credited this check with work it
+        # skipped: the standalone-detection regex decides what actually gets
+        # `bash -n`, and if it stops matching, every block is silently waived.
+        bad(f"0 of {len(blocks)} bash blocks were standalone enough to check")
     else:
-        ok(f"{len(blocks)} bash blocks, all syntax-clean")
+        ok(f"{checked} of {len(blocks)} bash blocks syntax-checked, all clean")
 
 
 def check_preamble_behaviour(doc: str) -> None:
